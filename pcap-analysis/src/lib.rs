@@ -1,7 +1,7 @@
 use brass_aphid_wire_messages::codec::DecodeValue;
-use brass_aphid_wire_messages::protocol::{ClientHello, HandshakeMessageHeader, RecordHeader};
-use etherparse::{IpHeader, LinkSlice, NetHeaders, SlicedPacket, TransportSlice};
-use pcap_parser::{parse_pcap, Capture, Linktype, PcapCapture};
+use brass_aphid_wire_messages::protocol::{ClientHello, HandshakeMessageHeader, RecordHeader, extensions::{Extension, ClientHelloExtensionData}};
+use etherparse::{SlicedPacket, TransportSlice};
+use pcap_parser::{Capture, Linktype, PcapCapture};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 
@@ -31,7 +31,7 @@ pub fn reassemble_tcp_streams<'a>(
     // LINUX_SLL is the type of header format that is used in the pcap.
     assert_eq!(capture.get_datalink(), Linktype::LINUX_SLL);
 
-    let total_blocks = capture.blocks.len();
+    let _total_blocks = capture.blocks.len();
 
     let header_parsed = capture
         .blocks
@@ -205,57 +205,171 @@ pub fn reassemble_tcp_streams<'a>(
 
 //     println!("observed {} flows", connections.len());
 // }
+fn raw_extensions(ch: &ClientHello) -> Vec<Extension> {
+    ch.extensions
+        .as_ref()
+        .map(|exts| exts.list().iter().filter_map(|ext| ext.raw_extension().ok()).collect())
+        .unwrap_or_default()
+}
 
-fn try_client_hello(mut data: &[u8]) -> Option<ClientHello> {
-    let (record_header, data) = RecordHeader::decode_from(data).ok()?;
-    let (message_header, data) = HandshakeMessageHeader::decode_from(data).ok()?;
+fn session_ticket_len(ch: &ClientHello) -> usize {
+    ch.extensions
+        .as_ref()
+        .and_then(|exts| {
+            exts.list().iter().find_map(|ext| match &ext.extension_data {
+                ClientHelloExtensionData::SessionTicket(st) => Some(st.ticket.len()),
+                _ => None,
+            })
+        })
+        .unwrap_or(0)
+}
+
+fn psk_identities_len(ch: &ClientHello) -> usize {
+    ch.extensions
+        .as_ref()
+        .and_then(|exts| {
+            exts.list().iter().find_map(|ext| match &ext.extension_data {
+                ClientHelloExtensionData::PreSharedKey(psk) => Some(psk.identities.list().len()),
+                _ => None,
+            })
+        })
+        .unwrap_or(0)
+}
+
+fn has_psk_ke_modes(ch: &ClientHello) -> bool {
+    ch.extensions
+        .as_ref()
+        .map(|exts| {
+            exts.list().iter().any(|ext| {
+                matches!(
+                    ext.extension_data,
+                    ClientHelloExtensionData::PskKeyExchangeModes(_)
+                )
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn has_supported_versions_tls13(ch: &ClientHello) -> bool {
+    // Optional, but useful to keep your TLS1.2/TLS1.3 logic honest
+    ch.extensions
+        .as_ref()
+        .map(|exts| {
+            exts.list().iter().any(|ext| match &ext.extension_data {
+                ClientHelloExtensionData::SupportedVersions(sv) => sv
+                    .versions
+                    .list()
+                    .iter()
+                    .any(|v| *v == brass_aphid_wire_messages::iana::Protocol::TLSv1_3),
+                _ => false,
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn try_client_hello(data: &[u8]) -> Option<ClientHello> {
+    let (_record_header, data) = RecordHeader::decode_from(data).ok()?;
+    let (_message_header, data) = HandshakeMessageHeader::decode_from(data).ok()?;
     ClientHello::decode_from_exact(data).ok()
 }
 
 #[cfg(test)]
 mod tests {
-    use std::hash::Hash;
-
-    use brass_aphid_wire_messages::{codec::{DecodeValue, EncodeValue}, protocol::RecordHeader};
-    use pcap_parser::{parse_pcap, Capture, Linktype};
+    use brass_aphid_wire_messages::{codec::EncodeValue, protocol::extensions::ClientHelloExtensionData};
+    use pcap_parser::{parse_pcap, Linktype};
 
     use super::*;
 
-    const PCAP_PATH: &str = "/home/ubuntu/traffic.pcap";
+    const PCAP_PATH: &str = "pcap/jlbrelay_traffic_capture_30_min.pcap";
 
     #[test]
     fn read_pcap() {
         let pcap = std::fs::read(PCAP_PATH).unwrap();
-        let (remaining, captures) = parse_pcap(&pcap).unwrap();
+        let (_remaining, captures) = parse_pcap(&pcap).unwrap();
         println!("header: {:?}", captures.header);
         let link = captures.get_datalink();
         println!("link type: {link:?}");
         assert_eq!(link, Linktype::LINUX_SLL);
-        let frames = captures.blocks.iter().next().unwrap();
+        let _frames = captures.blocks.iter().next().unwrap();
     }
 
     #[test]
     fn reassemble() {
+        use std::collections::HashMap;
+
         let pcap = std::fs::read(PCAP_PATH).unwrap();
-        let (remaining, captures) = parse_pcap(&pcap).unwrap();
+        let (_remaining, captures) = parse_pcap(&pcap).unwrap();
         println!("header: {:?}", captures.header);
+
         let streams = reassemble_tcp_streams(captures);
 
-        let mut found_client_hello = 0;
         let client_hellos: Vec<ClientHello> = streams
             .values()
             .filter_map(|contents| {
                 contents
                     .iter()
-                    .find(|contents| try_client_hello(contents.data).is_some())
-                    .map(|content| try_client_hello(content.data).unwrap())
+                    .find(|c| try_client_hello(c.data).is_some())
+                    .map(|c| try_client_hello(c.data).unwrap())
             })
             .collect();
+
         let mut distinct_client_hellos: HashMap<usize, ClientHello> = HashMap::new();
         for ch in client_hellos {
             let ch_length = ch.encode_to_vec().unwrap().len();
-            distinct_client_hellos.insert(ch_length, ch.clone());
-        };
-        println!("{distinct_client_hellos:#?}");
+            distinct_client_hellos.insert(ch_length, ch);
+        }
+
+        let mut no_resumption_plus_one = 0usize;
+        let mut resumption_attempted = 0usize;
+
+        for (_len, ch) in &distinct_client_hellos {
+            let ticket_len = ch
+                .extensions
+                .as_ref()
+                .and_then(|exts| {
+                    exts.list().iter().find_map(|ext| match &ext.extension_data {
+                        ClientHelloExtensionData::SessionTicket(st) => Some(st.ticket.len()),
+                        _ => None,
+                    })
+                })
+                .unwrap_or(0);
+
+            let psk_identities = ch
+                .extensions
+                .as_ref()
+                .and_then(|exts| {
+                    exts.list().iter().find_map(|ext| match &ext.extension_data {
+                        ClientHelloExtensionData::PreSharedKey(psk) => Some(psk.identities.list().len()),
+                        _ => None,
+                    })
+                })
+                .unwrap_or(0);
+
+            let has_psk_ke_modes = ch
+                .extensions
+                .as_ref()
+                .map(|exts| {
+                    exts.list().iter().any(|ext| {
+                        matches!(
+                            ext.extension_data,
+                            ClientHelloExtensionData::PskKeyExchangeModes(_)
+                        )
+                    })
+                })
+                .unwrap_or(false);
+
+            // Your requested heuristics:
+            if ticket_len == 0 || !has_psk_ke_modes {
+                no_resumption_plus_one += 1;
+            }
+
+            if ticket_len > 0 || psk_identities > 0 {
+                resumption_attempted += 1;
+            }
+        }
+
+        println!("distinct_client_hellos: {}", distinct_client_hellos.len());
+        println!("no_resumption_support(+1 heuristic): {no_resumption_plus_one}");
+        println!("resumption_attempted: {resumption_attempted}");
     }
 }
