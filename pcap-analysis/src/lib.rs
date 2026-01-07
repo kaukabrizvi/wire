@@ -246,11 +246,8 @@ fn supports_resumption(ch: &ClientHello, version: TlsVersion) -> bool {
     match version {
         TlsVersion::Tls13 => has_psk_ke_modes(ch),
         TlsVersion::Tls10 | TlsVersion::Tls11 | TlsVersion::Tls12 => {
-            // For TLS ≤ 1.2, we consider it supports resumption if:
-            // - It has session ticket extension OR
-            // - Legacy session ID resumption is always available in protocol
-            ticket_len(ch).is_some() || session_id_len(ch) > 0
-        } // session ID resumption always available
+            ticket_len(ch).is_some()
+        } 
         TlsVersion::Unknown => false,
     }
 }
@@ -260,8 +257,8 @@ fn attempts_resumption(ch: &ClientHello, version: TlsVersion) -> bool {
     match version {
         TlsVersion::Tls13 => psk_identities(ch) > 0,
         TlsVersion::Tls10 | TlsVersion::Tls11 | TlsVersion::Tls12 => {
-            // Attempts if session_id.len() > 0 OR ticket with non-empty bytes
-            session_id_len(ch) > 0 || matches!(ticket_len(ch), Some(n) if n > 0)
+            // Attempts if there is a ticket with non-empty bytes
+            matches!(ticket_len(ch), Some(n) if n > 0)
         }
         TlsVersion::Unknown => false,
     }
