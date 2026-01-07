@@ -1,5 +1,6 @@
 use brass_aphid_wire_messages::codec::DecodeValue;
-use brass_aphid_wire_messages::protocol::{ClientHello, HandshakeMessageHeader, RecordHeader, ServerHello, extensions::{Extension, ClientHelloExtensionData, ExtensionType}};
+use brass_aphid_wire_messages::protocol::{ClientHello, HandshakeMessageHeader, RecordHeader, ServerHello, extensions::{ClientHelloExtensionData, ExtensionType}};
+use brass_aphid_wire_messages::iana::Protocol;
 use etherparse::{SlicedPacket, TransportSlice};
 use pcap_parser::{Capture, Linktype, PcapCapture};
 use std::collections::{HashMap, HashSet};
@@ -11,7 +12,7 @@ pub fn add(left: u64, right: u64) -> u64 {
 
 /// A struct to track a TCP connection
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
-struct TcpFlow {
+pub struct TcpFlow {
     source: SocketAddr,
     destination: SocketAddr,
 }
@@ -29,9 +30,38 @@ impl TcpFlow {
 ///
 /// This generic lifetime parameter will generally be the lifetime of the
 /// PcapCapture object which owns the actual packet content.
-struct TcpContent<'a> {
+pub struct TcpContent<'a> {
     seq_number: u32,
     data: &'a [u8],
+}
+
+/// TLS version derived from ClientHello
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TlsVersion {
+    Tls10,
+    Tls11,
+    Tls12,
+    Tls13,
+    Unknown,
+}
+
+/// Normalized record per flow
+#[derive(Debug, Clone)]
+pub struct FlowObs {
+    pub flow: TcpFlow,
+    pub ch: ClientHello,
+    pub sh: Option<ServerHello>,
+    pub version: TlsVersion,
+    pub supports: bool,
+    pub attempts: bool,
+    pub succeeds: bool,
+    // Additional debug fields
+    pub src_dst: String,
+    pub session_id_len: usize,
+    pub psk_identities: usize,
+    pub has_psk_ke_modes: bool,
+    pub has_server_hello: bool,
+    pub ticket_len: Option<usize>,
 }
 
 pub fn reassemble_tcp_streams<'a>(
@@ -133,6 +163,126 @@ pub fn reassemble_tcp_streams<'a>(
     connections
 }
 
+/// Determine TLS version from ClientHello
+fn tls_version_from_client_hello(ch: &ClientHello) -> TlsVersion {
+    // Check for SupportedVersions extension (ext 43) first
+    if let Some(extensions) = &ch.extensions {
+        for ext in extensions.list() {
+            if let ClientHelloExtensionData::SupportedVersions(sv) = &ext.extension_data {
+                let versions = sv.versions.list();
+                // If it includes TLS 1.3 (0x0304), it's TLS 1.3
+                if versions.contains(&Protocol::TLSv1_3) {
+                    return TlsVersion::Tls13;
+                }
+                // Otherwise take the highest listed version
+                if versions.contains(&Protocol::TLSv1_2) {
+                    return TlsVersion::Tls12;
+                }
+                if versions.contains(&Protocol::TLSv1_1) {
+                    return TlsVersion::Tls11;
+                }
+                if versions.contains(&Protocol::TLSv1_0) {
+                    return TlsVersion::Tls10;
+                }
+            }
+        }
+    }
+    
+    // Fall back to legacy client_version field
+    match ch.protocol_version {
+        Protocol::TLSv1_0 => TlsVersion::Tls10,
+        Protocol::TLSv1_1 => TlsVersion::Tls11,
+        Protocol::TLSv1_2 => TlsVersion::Tls12,
+        Protocol::TLSv1_3 => TlsVersion::Tls13,
+        _ => TlsVersion::Unknown,
+    }
+}
+
+/// Get session ticket length from ClientHello
+fn ticket_len(ch: &ClientHello) -> Option<usize> {
+    ch.extensions.as_ref()?.list().iter().find_map(|ext| {
+        match &ext.extension_data {
+            ClientHelloExtensionData::SessionTicket(st) => Some(st.ticket.len()),
+            _ => None,
+        }
+    })
+}
+
+/// Get number of PSK identities from ClientHello
+fn psk_identities(ch: &ClientHello) -> usize {
+    ch.extensions.as_ref()
+        .and_then(|exts| exts.list().iter().find_map(|ext| {
+            match &ext.extension_data {
+                ClientHelloExtensionData::PreSharedKey(psk) => Some(psk.identities.list().len()),
+                _ => None,
+            }
+        }))
+        .unwrap_or(0)
+}
+
+/// Check if ClientHello has PSK key exchange modes
+fn has_psk_ke_modes(ch: &ClientHello) -> bool {
+    ch.extensions.as_ref()
+        .map(|exts| exts.list().iter().any(|ext| {
+            matches!(ext.extension_data, ClientHelloExtensionData::PskKeyExchangeModes(_))
+        }))
+        .unwrap_or(false)
+}
+
+/// Get session ID length from ClientHello
+fn session_id_len(ch: &ClientHello) -> usize {
+    ch.session_id.blob().len()
+}
+
+/// Check if ServerHello selected a PSK
+fn server_selected_psk(sh: &ServerHello) -> bool {
+    sh.extensions.list().iter().any(|ext| {
+        ext.extension_type == ExtensionType::PreSharedKey
+    })
+}
+
+/// Determine if client supports resumption for given TLS version
+fn supports_resumption(ch: &ClientHello, version: TlsVersion) -> bool {
+    match version {
+        TlsVersion::Tls13 => has_psk_ke_modes(ch),
+        TlsVersion::Tls10 | TlsVersion::Tls11 | TlsVersion::Tls12 => {
+            // For TLS ≤ 1.2, we consider it supports resumption if:
+            // - It has session ticket extension OR
+            // - Legacy session ID resumption is always available in protocol
+            ticket_len(ch).is_some() || session_id_len(ch) > 0
+        } // session ID resumption always available
+        TlsVersion::Unknown => false,
+    }
+}
+
+/// Determine if client attempts resumption for given TLS version
+fn attempts_resumption(ch: &ClientHello, version: TlsVersion) -> bool {
+    match version {
+        TlsVersion::Tls13 => psk_identities(ch) > 0,
+        TlsVersion::Tls10 | TlsVersion::Tls11 | TlsVersion::Tls12 => {
+            // Attempts if session_id.len() > 0 OR ticket with non-empty bytes
+            session_id_len(ch) > 0 || matches!(ticket_len(ch), Some(n) if n > 0)
+        }
+        TlsVersion::Unknown => false,
+    }
+}
+
+/// Determine if resumption succeeded for given TLS version
+fn succeeds_resumption(ch: &ClientHello, sh: &ServerHello, version: TlsVersion) -> bool {
+    match version {
+        TlsVersion::Tls13 => server_selected_psk(sh),
+        TlsVersion::Tls10 | TlsVersion::Tls11 | TlsVersion::Tls12 => {
+            // Success if client attempted via session ID and server echoed same session ID
+            if session_id_len(ch) > 0 {
+                ch.session_id.blob() == sh.session_id_echo.blob()
+            } else {
+                false
+            }
+        }
+        TlsVersion::Unknown => false,
+    }
+}
+
 // /// Given the path to some pcap, this will read in the pcap file and reassemble all
 // /// of the various TCP streams that were presented.
 // ///
@@ -218,7 +368,6 @@ pub fn reassemble_tcp_streams<'a>(
 
 #[cfg(test)]
 mod tests {
-    use brass_aphid_wire_messages::{codec::EncodeValue, protocol::extensions::ClientHelloExtensionData};
     use pcap_parser::{parse_pcap, Linktype};
 
     use super::*;
@@ -230,10 +379,10 @@ mod tests {
         ClientHello::decode_from_exact(data).ok()
     }
     fn try_server_hello(data: &[u8]) -> Option<ServerHello> {
-    let (_record_header, data) = RecordHeader::decode_from(data).ok()?;
-    let (message_header, data) = HandshakeMessageHeader::decode_from(data).ok()?;
-    ServerHello::decode_from_exact(data).ok()
-}
+        let (_record_header, data) = RecordHeader::decode_from(data).ok()?;
+    let (_message_header, data) = HandshakeMessageHeader::decode_from(data).ok()?;
+        ServerHello::decode_from_exact(data).ok()
+    }
 
     #[test]
     fn read_pcap() {
@@ -273,86 +422,96 @@ mod tests {
             pairs.push((flow, ch, sh));
         }
 
-        // Create distinct client hellos from pairs
-        let mut distinct: HashMap<Vec<u8>, ClientHello> = HashMap::new();
-        for (_flow, ch, _sh) in &pairs {
-                let bytes = ch.encode_to_vec().unwrap();
-                distinct.entry(bytes).or_insert(ch.clone());
-            }
+        // Build FlowObs from pairs
+        let mut obs = Vec::new();
+        for (flow, ch, sh) in pairs {
+            let version = tls_version_from_client_hello(&ch);
+            let supports = supports_resumption(&ch, version);
+            let attempts = attempts_resumption(&ch, version);
+            let succeeds = sh.as_ref().map(|sh| succeeds_resumption(&ch, sh, version)).unwrap_or(false);
+            
+            let flow_obs = FlowObs {
+                src_dst: format!("{}→{}", flow.source, flow.destination),
+                session_id_len: session_id_len(&ch),
+                psk_identities: psk_identities(&ch),
+                has_psk_ke_modes: has_psk_ke_modes(&ch),
+                has_server_hello: sh.is_some(),
+                ticket_len: ticket_len(&ch),
+                flow,
+                ch,
+                sh,
+                version,
+                supports,
+                attempts,
+                succeeds,
+            };
+            
+            obs.push(flow_obs);
+        }
 
-            let mut no_resumption_support = 0usize;
-            let mut resumption_attempted = 0usize;
-            let mut resumption_supported_but_not_attempted = 0usize;
-            let mut successful_handshakes = 0usize;
-            let mut missing_server_hello = 0usize;
+        // Count by version
+        let mut counts_by_version: HashMap<TlsVersion, usize> = HashMap::new();
+        let mut supports_by_version: HashMap<TlsVersion, usize> = HashMap::new();
+        let mut attempts_by_version: HashMap<TlsVersion, usize> = HashMap::new();
+        let mut succeeds_by_version: HashMap<TlsVersion, usize> = HashMap::new();
+        let mut supports_no_attempt_by_version: HashMap<TlsVersion, usize> = HashMap::new();
 
-            for (_flow, ch, sh_opt) in &pairs {
-                let Some(sh) = sh_opt else {
-                    missing_server_hello += 1;
-                    continue;
-                };
-
-                // --- Signals from ClientHello ---
-                let ticket_len: Option<usize> = ch.extensions.as_ref().and_then(|exts| {
-                    exts.list().iter().find_map(|ext| match &ext.extension_data {
-                        ClientHelloExtensionData::SessionTicket(st) => Some(st.ticket.len()),
-                        _ => None,
-                    })
-                });
-
-                let psk_identities = ch.extensions.as_ref().and_then(|exts| {
-                    exts.list().iter().find_map(|ext| match &ext.extension_data {
-                        ClientHelloExtensionData::PreSharedKey(psk) => Some(psk.identities.list().len()),
-                        _ => None,
-                    })
-                }).unwrap_or(0);
-
-                let has_psk_ke_modes = ch.extensions.as_ref().map(|exts| {
-                    exts.list().iter().any(|ext| matches!(
-                        ext.extension_data,
-                        ClientHelloExtensionData::PskKeyExchangeModes(_)
-                    ))
-                }).unwrap_or(false);
-
-                // Support = either ticket support OR PSK support (NOT both)
-                let supports_resumption = ticket_len.is_some() || has_psk_ke_modes;
-
-                // Attempt = actual ticket bytes OR actual PSK identities
-                let attempted_resumption =
-                    matches!(ticket_len, Some(n) if n > 0) || psk_identities > 0;
-
-                // --- Success from ServerHello ---
-                let server_selected_psk = sh.extensions.list().iter().any(|ext| {
-                    ext.extension_type
-                        == brass_aphid_wire_messages::protocol::extensions::ExtensionType::PreSharedKey
-                });
-
-                // IMPORTANT: session_id_echo matching is NOT resumption in TLS 1.3.
-                // Only use this if you *know* it's TLS 1.2. If you don't know, drop it for now.
-                let session_ids_match_tls12 = false; // safest: disable until you add TLS version gating
-
-                let successful_resumption =
-                    server_selected_psk || session_ids_match_tls12;
-
-                // --- Categorize ---
-                if !supports_resumption {
-                    no_resumption_support += 1;
-                } else if !attempted_resumption {
-                    resumption_supported_but_not_attempted += 1;
+        for flow_obs in &obs {
+            *counts_by_version.entry(flow_obs.version).or_insert(0) += 1;
+            
+            if flow_obs.supports {
+                *supports_by_version.entry(flow_obs.version).or_insert(0) += 1;
+                
+                if flow_obs.attempts {
+                    *attempts_by_version.entry(flow_obs.version).or_insert(0) += 1;
+                    
+                    if flow_obs.succeeds {
+                        *succeeds_by_version.entry(flow_obs.version).or_insert(0) += 1;
+                    }
                 } else {
-                    resumption_attempted += 1;
-                }
-
-                if successful_resumption {
-                    successful_handshakes += 1;
+                    *supports_no_attempt_by_version.entry(flow_obs.version).or_insert(0) += 1;
                 }
             }
+        }
 
-        println!("handshake_pairs: {}", pairs.len());
-        println!("missing_server_hello: {missing_server_hello}");
-        println!("no_resumption_support: {no_resumption_support}");
-        println!("resumption_attempted: {resumption_attempted}");
-        println!("resumption_supported_but_not_attempted: {resumption_supported_but_not_attempted}");
-        println!("successful_handshakes: {successful_handshakes}");
+        println!("\n=== TLS Resumption Analysis ===");
+        println!("Total handshake pairs: {}", obs.len());
+        
+        println!("\n--- ClientHellos by Version ---");
+        for version in [TlsVersion::Tls10, TlsVersion::Tls11, TlsVersion::Tls12, TlsVersion::Tls13, TlsVersion::Unknown] {
+            if let Some(count) = counts_by_version.get(&version) {
+                println!("{:?}: {}", version, count);
+            }
+        }
+        
+        println!("\n--- Resumption Support by Version ---");
+        for version in [TlsVersion::Tls10, TlsVersion::Tls11, TlsVersion::Tls12, TlsVersion::Tls13, TlsVersion::Unknown] {
+            let total = counts_by_version.get(&version).unwrap_or(&0);
+            let supports = supports_by_version.get(&version).unwrap_or(&0);
+            let no_support = total - supports;
+            if *total > 0 {
+                println!("{:?}: supports={}, no_support={}", version, supports, no_support);
+            }
+        }
+        
+        println!("\n--- Resumption Attempts by Version ---");
+        for version in [TlsVersion::Tls10, TlsVersion::Tls11, TlsVersion::Tls12, TlsVersion::Tls13, TlsVersion::Unknown] {
+            let supports = supports_by_version.get(&version).unwrap_or(&0);
+            let attempts = attempts_by_version.get(&version).unwrap_or(&0);
+            let supports_no_attempt = supports_no_attempt_by_version.get(&version).unwrap_or(&0);
+            if *supports > 0 {
+                println!("{:?}: attempts={}, supports_no_attempt={}", version, attempts, supports_no_attempt);
+            }
+        }
+        
+        println!("\n--- Resumption Success by Version ---");
+        for version in [TlsVersion::Tls10, TlsVersion::Tls11, TlsVersion::Tls12, TlsVersion::Tls13, TlsVersion::Unknown] {
+            let attempts = attempts_by_version.get(&version).unwrap_or(&0);
+            let succeeds = succeeds_by_version.get(&version).unwrap_or(&0);
+            if *attempts > 0 {
+                let success_rate = (*succeeds as f64 / *attempts as f64) * 100.0;
+                println!("{:?}: successes={}/{} ({:.1}%)", version, succeeds, attempts, success_rate);
+            }
+        }
     }
 }
