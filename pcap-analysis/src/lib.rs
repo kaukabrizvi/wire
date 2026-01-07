@@ -372,7 +372,7 @@ mod tests {
 
     use super::*;
 
-    const PCAP_PATH: &str = "pcap/jlbrelay_traffic_capture_30_min.pcap";
+    const PCAP_PATH: &str = "pcap/INSERT";
     fn try_client_hello(data: &[u8]) -> Option<ClientHello> {
         let (_record_header, data) = RecordHeader::decode_from(data).ok()?;
         let (_message_header, data) = HandshakeMessageHeader::decode_from(data).ok()?;
